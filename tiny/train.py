@@ -126,6 +126,12 @@ parser.add_argument("--mtp-predict", type=int, default=3,
                     help="MTP: number of future tokens predicted from each position (1 = plain next-token).")
 parser.add_argument("--mtp-anneal-frac", type=float, default=0.66,
                     help="Fraction of training over which the extra MTP heads decay to zero weight.")
+parser.add_argument("--iha", action="store_true", default=True,
+                    help="Enable Interleaved Head Attention (cross-head Q/K/V mixing)")
+parser.add_argument("--no-iha", action="store_false", dest="iha",
+                    help="Disable IHA cross-head mixing")
+parser.add_argument("--iha-lr", type=float, default=0.02,
+                    help="LR for IHA mixing matrices")
 args = parser.parse_args()
 
 # Resolve output path
@@ -393,6 +399,8 @@ class GPTConfig:
     xsa_mode: str = "all"
     xsa_eps: float = 1e-4
     num_iterations: int = NUM_ITERATIONS
+    use_iha: bool = False
+    iha_mix_v: bool = True
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -430,12 +438,35 @@ class CausalSelfAttention(nn.Module):
         char = pattern[layer_idx % len(pattern)]
         self.use_key_offset = (char == 'L') or (layer_idx == config.n_layer - 1)
         self.xsa_eps = config.xsa_eps
+        # IHA: cross-head mixing matrices fused into projection weights at forward time.
+        self.use_iha = config.use_iha
+        if self.use_iha:
+            self.q_mix = nn.Parameter(torch.zeros(self.n_head, self.n_head))
+            self.k_mix = nn.Parameter(torch.zeros(self.n_kv_head, self.n_kv_head))
+            self.iha_mix_v = config.iha_mix_v
+            if self.iha_mix_v:
+                self.v_mix = nn.Parameter(torch.zeros(self.n_kv_head, self.n_kv_head))
+
+    def _fuse_mix(self, weight, mix, H):
+        d = self.head_dim
+        return (mix @ weight.view(H, d, -1).flatten(1)).view_as(weight)
 
     def forward(self, x, ve, cos_sin, window_size, xsa_alpha=None):
         B, T, C = x.size()
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        if self.use_iha:
+            q = F.linear(x, self._fuse_mix(self.c_q.weight, self.q_mix, self.n_head))
+            q = q.view(B, T, self.n_head, self.head_dim)
+            k = F.linear(x, self._fuse_mix(self.c_k.weight, self.k_mix, self.n_kv_head))
+            k = k.view(B, T, self.n_kv_head, self.head_dim)
+            if self.iha_mix_v:
+                v = F.linear(x, self._fuse_mix(self.c_v.weight, self.v_mix, self.n_kv_head))
+                v = v.view(B, T, self.n_kv_head, self.head_dim)
+            else:
+                v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        else:
+            q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+            k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+            v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
         # Value residual (ResFormer)
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
@@ -547,6 +578,11 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
             torch.nn.init.zeros_(block.attn.attn_gate.weight)
+            if block.attn.use_iha:
+                torch.nn.init.eye_(block.attn.q_mix)
+                torch.nn.init.eye_(block.attn.k_mix)
+                if block.attn.iha_mix_v:
+                    torch.nn.init.eye_(block.attn.v_mix)
         self.skip_weights.fill_(1.0)
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
@@ -626,15 +662,22 @@ class GPT(nn.Module):
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
-        # Separate attn_gate params (small, Adam-optimized) from matrix params (Muon)
         attn_gate_params = [block.attn.attn_gate.weight for block in self.transformer.h]
         attn_gate_ids = {id(p) for p in attn_gate_params}
+        iha_params = []
+        iha_param_ids = set()
+        for block in self.transformer.h:
+            if block.attn.use_iha:
+                iha_params.append(block.attn.q_mix)
+                iha_params.append(block.attn.k_mix)
+                iha_param_ids.add(id(block.attn.q_mix))
+                iha_param_ids.add(id(block.attn.k_mix))
+                if block.attn.iha_mix_v:
+                    iha_params.append(block.attn.v_mix)
+                    iha_param_ids.add(id(block.attn.v_mix))
+        excluded_ids = attn_gate_ids | iha_param_ids
         all_h_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
-        matrix_params = [
-            p
-            for p in all_h_params
-            if id(p) not in attn_gate_ids
-        ]
+        matrix_params = [p for p in all_h_params if id(p) not in excluded_ids]
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
@@ -653,6 +696,9 @@ class GPT(nn.Module):
         if xsa_params:
             param_groups.append(dict(kind='adamw', params=xsa_params, lr=SCALAR_LR,
                                      betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0))
+        if iha_params:
+            param_groups.append(dict(kind='adamw', params=iha_params, lr=args.iha_lr,
+                                     betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0))
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
@@ -1198,6 +1244,7 @@ print0(f"  dropout={args.dropout}")
 print0(f"  doc_shuffle={not args.no_doc_shuffle}")
 print0(f"  max_train_steps={args.max_train_steps}, xsa_mode={args.xsa_mode}")
 print0(f"  mtp_predict={args.mtp_predict}, mtp_anneal_frac={args.mtp_anneal_frac}")
+print0(f"  iha={args.iha}, iha_lr={args.iha_lr}")
 print0(f"  run={run_name}")
 print0(f"  run_dir={run_dir}")
 print0(f"-----------------------")
@@ -1218,7 +1265,8 @@ token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
 # Build model
 config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout, device_batch_size=args.device_batch_size,
-                   xsa_mode=args.xsa_mode, num_iterations=NUM_ITERATIONS)
+                   xsa_mode=args.xsa_mode, num_iterations=NUM_ITERATIONS,
+                   use_iha=args.iha, iha_mix_v=args.iha)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)

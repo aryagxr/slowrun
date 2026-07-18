@@ -391,7 +391,8 @@ class GPTConfig:
     vocab_size: int = 32768
     n_layer: int = DEPTH
     n_head: int = N_HEAD
-    n_kv_head: int = N_HEAD
+    n_kv_head: int = 4
+    n_kv_head_local: int = 8
     n_embd: int = N_EMBD
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.05
@@ -419,10 +420,14 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
+        
+        pattern = config.window_pattern.upper()
+        char = pattern[layer_idx % len(pattern)]
+        is_global = (char == 'L') or (layer_idx == config.n_layer - 1)
+        self.n_kv_head = config.n_kv_head if is_global else config.n_kv_head_local
         self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
@@ -433,10 +438,7 @@ class CausalSelfAttention(nn.Module):
         # Per-head attention gate: enables context-based attention no-op
         self.attn_gate_channels = 12
         self.attn_gate = nn.Linear(self.attn_gate_channels, self.n_head, bias=False)
-        # Determine if this is a long-window layer for partial key offset
-        pattern = config.window_pattern.upper()
-        char = pattern[layer_idx % len(pattern)]
-        self.use_key_offset = (char == 'L') or (layer_idx == config.n_layer - 1)
+        self.use_key_offset = is_global
         self.xsa_eps = config.xsa_eps
         # IHA: cross-head mixing matrices fused into projection weights at forward time.
         self.use_iha = config.use_iha
@@ -481,8 +483,10 @@ class CausalSelfAttention(nn.Module):
         y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         if xsa_alpha is not None:
             v_ref = v
-            if self.n_kv_head != self.n_head:
+            if self.n_kv_head < self.n_head:
                 v_ref = v_ref.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
+            elif self.n_kv_head > self.n_head:
+                v_ref = v_ref.view(B, T, self.n_head, self.n_kv_head // self.n_head, self.head_dim).mean(dim=3)
             alpha = torch.tanh(xsa_alpha).type_as(y).view(1, 1, self.n_head, 1)
             v_hat = v_ref / v_ref.square().sum(dim=-1, keepdim=True).sqrt().clamp_min(self.xsa_eps)
             xsa_coeff = ((y * v_hat).sum(dim=-1, keepdim=True)) * alpha
@@ -544,8 +548,10 @@ class GPT(nn.Module):
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         head_dim = config.n_embd // config.n_head
-        kv_dim = config.n_kv_head * head_dim
-        self.ve_projs = nn.ModuleDict({str(i): nn.Linear(config.n_embd, kv_dim, bias=False) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        self.ve_projs = nn.ModuleDict({
+            str(i): nn.Linear(config.n_embd, self.transformer.h[i].attn.n_kv_head * head_dim, bias=False)
+            for i in range(config.n_layer) if has_ve(i, config.n_layer)
+        })
         # U-Net skip connections: encoder layer i → decoder layer (n_layer - 1 - i)
         self.encoder_layers = config.n_layer // 2
         self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))

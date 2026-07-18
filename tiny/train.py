@@ -391,8 +391,8 @@ class GPTConfig:
     vocab_size: int = 32768
     n_layer: int = DEPTH
     n_head: int = N_HEAD
-    n_kv_head: int = 4
-    n_kv_head_local: int = 8
+    n_kv_head: int = N_HEAD
+    n_kv_head_local: int = N_HEAD
     n_embd: int = N_EMBD
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.05
@@ -827,6 +827,8 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     momentum_update = (1 - momentum) * active
     momentum_buffer.mul_(1 - momentum_update).add_(stacked_grads * momentum_update)
     g = stacked_grads.lerp(momentum_buffer, momentum) * active
+    # MuonEq-R row normalization
+    g /= g.float().norm(dim=-1, keepdim=True).clamp_min(1e-7).to(g.dtype)
     # Polar Express orthogonalization
     X = g.bfloat16()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
